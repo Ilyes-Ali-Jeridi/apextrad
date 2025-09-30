@@ -1,0 +1,9 @@
+tensorflow
+tensorflow-quantum
+tensorflow-probability
+cirq
+pandas
+numpy
+websockets
+python-binance
+TA-Lib
