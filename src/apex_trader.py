@@ -103,8 +103,11 @@ class ApexQuantumTrader:
                     if features is None:
                         continue
 
-                    # Make a prediction with the model
-                    pred = self.model(np.expand_dims(features, axis=0))
+                    # Make a prediction with the model using executor thread
+                    pred = await asyncio.get_event_loop().run_in_executor(
+                        None, 
+                        lambda: self.model(np.expand_dims(features, axis=0))
+                    )
 
                     # Execute a trade if uncertainty is below the threshold
                     if pred['uncertainty'].numpy()[0][0] < Config.UNCERTAINTY_THRESHOLD:
@@ -138,8 +141,15 @@ class ApexQuantumTrader:
                     # Handle websocket timeouts by reconnecting
                     logging.warning("Websocket timeout. Reconnecting...")
                     print("Websocket timeout. Reconnecting...")
-                    for ws in ws_sockets:
-                        await ws.close()
+                    
+                    # Properly close websockets
+                    try:
+                        await asyncio.gather(
+                            *[ws.close() for ws in ws_sockets],
+                            return_exceptions=True
+                        )
+                    except Exception as close_error:
+                        logging.warning(f"Error closing websockets: {close_error}")
 
                     logging.info(f"Waiting a few seconds before reconnecting websockets...")
                     await asyncio.sleep(5)
@@ -184,98 +194,63 @@ class ApexQuantumTrader:
                 print(f"Strategy: SELL signal detected (direction={direction:.3f} < 0.4). Executing SELL order.")
                 await self.engine.execute_order('SELL', position_size, mu + 1.5 * sigma)
             else:
-                logging.info(f"Strategy: Neutral signal (direction={direction:.3f}, uncertainty={prediction['uncertainty'].numpy()[0][0]:.3f}). No order executed.")
-                print(f"Strategy: Neutral signal (direction={direction:.3f}). No order executed.")
+                logging.info(f"Strategy: No clear signal (direction={direction:.3f} between 0.4 and 0.6). Holding position.")
+                print(f"Strategy: No clear signal (direction={direction:.3f}). Holding position.")
 
         except Exception as e:
-            logging.error(f"Error executing strategy: {e}", exc_info=True)
-            print(f"Error executing strategy: {e}")
+            logging.error(f"Error in _execute_strategy: {e}")
+            print(f"Error in _execute_strategy: {e}")
 
     def _calculate_position_size(self, action: float) -> float:
         """
-        Calculates the position size for a trade, adjusted for risk.
+        Calculates the position size based on the PPO agent's action and risk
+        management rules.
 
         Args:
-            action (float): The action from the PPO agent, which influences the
-                            risk adjustment.
+            action (float): The action from the PPO agent.
 
         Returns:
             float: The calculated position size.
         """
-        base_size = Config.BASE_POSITION * self.engine.balance
-        risk_adjusted = base_size * (1 + action * Config.RISK_LEVERAGE)
-        position_size = min(risk_adjusted, Config.MAX_POSITION)
-        logging.debug(f"Calculated position size: base_size={base_size}, risk_adjusted={risk_adjusted}, final_size={position_size}")
+        # Apply risk management
+        risk_adjusted_action = np.clip(action * Config.RISK_LEVERAGE, -Config.MAX_POSITION, Config.MAX_POSITION)
+        balance_float = float(self.engine.balance)
+        position_size = balance_float * abs(risk_adjusted_action) * Config.BASE_POSITION
+        
+        # Cap the position size at the risk limit
+        max_risk = balance_float * Config.RISK_CAP
+        position_size = min(position_size, max_risk)
+        
+        logging.info(f"Position size calculated: {position_size} (action={action:.3f}, balance={balance_float})")
         return position_size
 
     def _train_model(self):
         """
-        Trains the model using a hybrid approach that combines a price
-        prediction loss with a policy loss from the PPO agent.
-        """
-        if not self.ppo.buffer['states']:
-            logging.info("No data in buffer to train on. Skipping training.")
-            return
-
-        # Convert buffer deques to numpy arrays
-        states = np.array(list(self.ppo.buffer['states']))
-        actions = np.array(list(self.ppo.buffer['actions']))
-        rewards = np.array(list(self.ppo.buffer['rewards']))
-
-        # Ensure arrays have the correct dimensions
-        if states.ndim == 1:
-            states = np.expand_dims(states, axis=0)
-        if actions.ndim == 1:
-            actions = np.expand_dims(actions, axis=0)
-        if rewards.ndim == 1:
-            rewards = np.expand_dims(rewards, axis=0)
-
-        with tf.GradientTape() as tape:
-            # Get model predictions for the states in the buffer
-            pred = self.model(states)
-
-            # Calculate the price prediction loss (MSE)
-            price_loss = tf.keras.losses.MSE(
-                pred['price_params'][:, 0, 0],
-                np.array(list(self.feature_engine.close)[-len(states):])
-            )
-
-            # Calculate advantages and the PPO policy loss
-            advantages = self.ppo.calculate_advantages(rewards, pred['value'][-1].numpy()[0])
-            policy_loss = self.ppo.update_policy(states, actions, rewards)
-
-            # Combine the losses
-            total_loss = 0.7 * price_loss + 0.3 * policy_loss
-
-        # Apply gradients to update the model's weights
-        grads = tape.gradient(total_loss, self.model.trainable_variables)
-        self.ppo.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
-        logging.info(f"Model trained. Total Loss: {total_loss.numpy():.4f}, Price Loss: {price_loss.numpy():.4f}, Policy Loss: {policy_loss.numpy():.4f}")
-        print(f"Model trained. Total Loss: {total_loss.numpy():.4f}, Price Loss: {price_loss.numpy():.4f}, Policy Loss: {policy_loss.numpy():.4f}")
-
-    def _load_weights(self, path: str):
-        """
-        Loads pre-trained weights for the model.
-
-        Args:
-            path (str): The path to the weights file.
+        Trains the PPO model using the buffered experiences.
         """
         try:
-            self.model.load_weights(path)
-            logging.info(f"Loaded pretrained weights from {path}")
-        except:
-            logging.info("Initializing new model without pretrained weights.")
+            states = np.array(self.ppo.buffer['states'])
+            actions = np.array(self.ppo.buffer['actions'])
+            rewards = np.array(self.ppo.buffer['rewards'])
+            values = np.array(self.ppo.buffer['values'])
+            logprobs = np.array(self.ppo.buffer['logprobs'])
+            
+            # Train the PPO agent
+            self.ppo.train(states, actions, rewards, values, logprobs)
+            
+        except Exception as e:
+            logging.error(f"Error in _train_model: {e}")
+            print(f"Error in _train_model: {e}")
 
     def _process_trade(self, msg: str) -> dict | None:
         """
-        Processes a trade message from the Binance websocket.
+        Processes a trade message from the websocket.
 
         Args:
             msg (str): The raw websocket message.
 
         Returns:
-            dict | None: A dictionary containing the trade data, or None if the
-                         message is not a trade event.
+            dict | None: The processed trade data, or None if processing fails.
         """
         try:
             event = json.loads(msg)
@@ -291,28 +266,26 @@ class ApexQuantumTrader:
                 'bid': float(event['p']),
                 'ask': float(event['p'])
             }
-        except Exception as e:
-            logging.error(f"Error processing trade message: {e}", exc_info=True)
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logging.warning(f"Error processing trade message: {e}")
             return None
 
     def _process_book_ticker(self, msg: str) -> dict | None:
         """
-        Processes a book ticker message from the Binance websocket.
+        Processes a book ticker message from the websocket.
 
         Args:
             msg (str): The raw websocket message.
 
         Returns:
-            dict | None: A dictionary containing the best bid and ask, or None
-                         if the message cannot be parsed.
+            dict | None: The processed book ticker data, or None if processing fails.
         """
         try:
             event = json.loads(msg)
             return {
-                'bid': float(event['b']),
-                'ask': float(event['a'])
+                'bid': float(event.get('b', 0)),
+                'ask': float(event.get('a', 0))
             }
-        except (json.JSONDecodeError, KeyError) as e:
-            logging.error(f"Error processing book ticker message: {e}", exc_info=True)
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logging.warning(f"Error processing book ticker message: {e}")
             return None
-
