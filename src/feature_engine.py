@@ -70,12 +70,21 @@ class QuantumFeatureEngine:
         # Calculate various features
         features = {}
         try:
+            # Safe division for volume profile with explicit zero checks
+            volume_mean = np.mean(list(self.volume)) if self.volume else 0.0
+            current_volume = self.volume[-1] if self.volume else 0.0
+            
+            if volume_mean > 0 and current_volume > 0:
+                volume_profile = np.log(current_volume / volume_mean)
+            else:
+                volume_profile = 0.0
+                
             features = {
                 'vpin': self._calculate_vpin(),
                 'obv': talib.OBV(np.array(list(self.close)), np.array(list(self.volume)))[-1] if self.close and self.volume else 0.0,
                 'spread': (float(tick['ask']) - float(tick['bid'])),
                 'mid_price': (float(tick['ask']) + float(tick['bid'])) / 2,
-                'volume_profile': np.log(self.volume[-1] / np.mean(list(self.volume))) if self.volume and np.mean(list(self.volume)) > 0 and self.volume[-1] > 0 else 0.0
+                'volume_profile': volume_profile
             }
         except Exception as e:
             logging.error(f"Feature calculation error: {e}. Returning None features.")
