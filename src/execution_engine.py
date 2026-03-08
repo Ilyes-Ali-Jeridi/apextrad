@@ -1,49 +1,99 @@
-    def _build_quantum_execution_circuit(self):
+    async def execute_order(self, side: str, qty: float, limit_price: float):
         """
-        Builds the parameterized quantum circuit for price adjustments.
+        Executes a trade, either simulated or live.
+
+        In paper trading mode, it simulates the order and updates the balance
+        and position. In live mode, it places a limit order on Binance with a
+        price adjusted by a quantum circuit.
+
+        Args:
+            side (str): The order side ('BUY' or 'SELL').
+            qty (float): The quantity to trade.
+            limit_price (float): The limit price for the order.
 
         Returns:
-            cirq.Circuit: The quantum circuit.
+            bool: True if the order was successfully executed or simulated,
+                  False otherwise.
         """
-        q0 = cirq.GridQubit(0, 0)
-        spread_param = cirq.HashableParamExpr(cirq.Symbol('spread_param'))
-        
-        circuit = cirq.Circuit(
-            cirq.H(q0),
-            cirq.rx(spread_param)(q0),
-            cirq.measure(q0, key='m')
-        )
-        return circuit
+        if Config.PAPER_TRADING:
+            # Simulate the trade in paper trading mode
+            logging.info(f"PAPER TRADE: Simulating {side} order for {qty} {Config.TRADING_PAIR} at {limit_price}")
+            print(f"PAPER TRADE: Simulating {side} order for {qty} {Config.TRADING_PAIR} at {limit_price}")
+            fill_price = limit_price
+            fill_qty = qty
+            cost = fill_price * fill_qty
 
-    def _calculate_quantum_adjustment(self) -> float:
-        """
-        Calculates a price adjustment using a parameterized quantum circuit.
-        The adjustment is based on the current bid-ask spread.
+            if side == 'BUY':
+                self.position += Decimal(fill_qty)
+                self.balance -= Decimal(cost)
+            elif side == 'SELL':
+                self.position -= Decimal(fill_qty)
+                self.balance += Decimal(cost)
 
-        Returns:
-            float: The calculated price adjustment.
-        """
+            logging.info(f"PAPER TRADE: Order simulated - Filled {fill_qty} at {fill_price}. New Position: {self.position}, New Balance: {self.balance}")
+            print(f"PAPER TRADE: Order simulated - Filled {fill_qty} at {fill_price}. New Position: {self.position}, New Balance: {self.balance}")
+            return True
+
+        # Fetch order book once before retry loop
         try:
-            spread = (self.best_ask - self.best_bid) if hasattr(self, 'best_bid') and hasattr(self, 'best_ask') and self.best_bid and 
-self.best_ask else Decimal('0.0001')
-            scaled_spread = float(spread) / 100.0  # Normalize spread
-
-            # Create param resolver with matching symbol name
-            resolver = cirq.ParamResolver({'spread_param': scaled_spread})
-            
-            # Build expectation layer with matching symbols
-            expectation_layer = tfq.layers.Expectation()
-            expectation = expectation_layer(
-                [tfq.convert_to_tensor([self.quantum_circuit])],
-                symbol_names=['spread_param'],
-                symbol_values=[[scaled_spread]]
-            )
-            
-            exp_val = float(expectation.numpy()[0][0])
-            adjustment = 0.5 * (1.0 - exp_val)  # Map [-1,1] to [0,1] adjustment factor
-            
-            logging.debug(f"Quantum adjustment: {adjustment} based on spread: {spread}")
-            return adjustment
+            await self._update_order_book()
         except Exception as e:
-            logging.error(f"Error in quantum adjustment calculation: {e}")
-            return 0.0
+            logging.error(f"Failed to fetch initial order book: {e}")
+            return False
+
+        if not self.order_book['bids'] or not self.order_book['asks']:
+            logging.warning("Order book empty, cannot execute order.")
+            return False
+
+        # Execute the trade in live mode
+        for retry_attempt in range(self.MAX_RETRIES):
+            try:
+                # Calculate the mid-price and quantum adjustment
+                best_bid_price = Decimal(self.order_book['bids'][0][0])
+                best_ask_price = Decimal(self.order_book['asks'][0][0])
+                self.best_bid = best_bid_price
+                self.best_ask = best_ask_price
+                mid_price = (self.best_bid + self.best_ask) / 2
+                quantum_adjustment = self._calculate_quantum_adjustment()
+
+                # Adjust the price based on the quantum calculation
+                if side == 'BUY':
+                    price = mid_price * (1 - quantum_adjustment)
+                else:
+                    price = mid_price * (1 + quantum_adjustment)
+
+                # Quantize the price and size the position
+                price_quantized = Decimal(str(price)).quantize(Config.PRICE_PRECISION)
+                qty_sized = self._size_position(qty)
+
+                # Create the order
+                order = await self.client.create_order(
+                    symbol=Config.TRADING_PAIR,
+                    side=side,
+                    type='LIMIT',
+                    timeInForce='IOC',
+                    quantity=str(qty_sized),
+                    price=str(price_quantized)
+                )
+
+                logging.info(f"Order placed: {side} {qty_sized} {Config.TRADING_PAIR} at {price_quantized}")
+                await self._process_order_fills(order)
+                return True
+
+            except Exception as e:
+                # Only re-fetch order book on network/API errors, not on slippage/rejection
+                if isinstance(e, Exception):  # Placeholder for Binance exception handling
+                    try:
+                        await asyncio.sleep(0.5)
+                        await self._update_order_book()
+                    except Exception:
+                        pass  # Continue with cached order book on refresh failure
+                
+                # Retry with exponential backoff if the order fails
+                retry_delay = self.RETRY_DELAY_BASE * (2 ** retry_attempt)
+                logging.error(f"Execution error (attempt {retry_attempt + 1}/{self.MAX_RETRIES}): {e}. Retrying in {retry_delay} seconds...")
+                if retry_attempt == self.MAX_RETRIES - 1:
+                    logging.error(f"Max retries reached for order execution. Order failed.")
+                    return False
+                await asyncio.sleep(retry_delay)
+        return False
